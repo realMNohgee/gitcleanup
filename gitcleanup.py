@@ -80,6 +80,45 @@ def format_size(size_bytes: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# v2: Remote branch helpers
+# ---------------------------------------------------------------------------
+
+def get_remote_branches(remote: str = "origin") -> list[str]:
+    """Get list of remote branches."""
+    lines = git_lines("branch", "-r")
+    branches = []
+    prefix = f"{remote}/"
+    for line in lines:
+        clean = line.lstrip('*').strip()
+        if clean.startswith(prefix) and "HEAD" not in clean:
+            branches.append(clean)
+    return branches
+
+
+def get_remote_branch_age(branch: str) -> int:
+    """Get age of a remote branch in days."""
+    r = git("log", "-1", "--format=%ct", branch)
+    if r.returncode != 0 or not r.stdout.strip():
+        return 0
+    try:
+        ts = int(r.stdout.strip())
+        commit_date = datetime.fromtimestamp(ts, tz=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return (now - commit_date).days
+    except (ValueError, TypeError):
+        return 0
+
+
+def get_branch_activity(branch: str, days: int = 30) -> dict:
+    """Get commit activity for a branch."""
+    commits = git_lines("log", f"--since={days}.days", "--oneline", branch)
+    return {
+        "branch": branch,
+        "commits_30d": len(commits),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -129,6 +168,18 @@ def cmd_scan(args) -> int:
                 })
                 results["disk_space_savings"] += size
 
+    # v2: Remote branches check
+    if getattr(args, "remote", False):
+        remote_branches = get_remote_branches()
+        for rb in remote_branches:
+            age = get_remote_branch_age(rb)
+            if args.older_than and age >= args.older_than:
+                results["stale_remote_branches"] = results.get("stale_remote_branches", [])
+                results["stale_remote_branches"].append({
+                    "branch": rb,
+                    "age_days": age,
+                })
+
     # Stale remote refs
     remote_refs = git_lines("remote", "prune", "--dry-run", "origin")
     results["stale_remote_refs"] = [r.strip() for r in remote_refs if r.strip()]
@@ -162,6 +213,12 @@ def cmd_scan(args) -> int:
             print(f"\nStale branches > {args.older_than}d ({len(results['stale_branches'])}):")
             for b in results["stale_branches"]:
                 print(f"  {b['branch']:<30} age: {b['age_days']}d  size: ~{format_size(b['estimated_size'])}")
+
+        # v2: remote stale branches
+        if results.get("stale_remote_branches"):
+            print(f"\nStale remote branches > {args.older_than}d ({len(results['stale_remote_branches'])}):")
+            for b in results["stale_remote_branches"]:
+                print(f"  {b['branch']:<40} age: {b['age_days']}d")
 
         if results["stale_remote_refs"]:
             print(f"\nStale remote refs ({len(results['stale_remote_refs'])}):")
@@ -207,13 +264,47 @@ def cmd_clean(args) -> int:
         return 0
 
     if not args.force:
-        print(f"About to delete {len(to_delete)} merged branches:")
-        for b in to_delete:
-            print(f"  {b}")
-        response = input("Proceed? [y/N] ").strip().lower()
-        if response != 'y':
+        # v2: interactive mode — numbered list, user picks
+        print(f"Stale branches ({len(to_delete)}):")
+        for idx, b in enumerate(to_delete, 1):
+            age = get_branch_age(b)
+            print(f"  {idx}. {b:<30} age: {age}d")
+        print()
+        response = input("Delete which? [numbers / all / none] ").strip().lower()
+
+        if response == "none":
             print("Aborted.")
             return 0
+        elif response == "all":
+            pass  # use to_delete as-is
+        else:
+            # Parse numbers
+            try:
+                selected_indices = []
+                for part in response.split():
+                    if "-" in part:
+                        start, end = part.split("-", 1)
+                        selected_indices.extend(range(int(start), int(end) + 1))
+                    else:
+                        selected_indices.append(int(part))
+                to_delete = [to_delete[i - 1] for i in selected_indices if 1 <= i <= len(to_delete)]
+            except (ValueError, IndexError):
+                print("Invalid selection. Aborted.", file=sys.stderr)
+                return 1
+
+            if not to_delete:
+                print("No branches selected. Aborted.")
+                return 0
+
+            # Confirm
+            print(f"\nWill delete: {', '.join(to_delete)}")
+            confirm = input("Proceed? [y/N] ").strip().lower()
+            if confirm != 'y':
+                print("Aborted.")
+                return 0
+    else:
+        # v2: interactive mode is skipped with --force
+        pass
 
     deleted = []
     for b in to_delete:
@@ -296,6 +387,158 @@ def cmd_orphans(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# v2: notify command
+# ---------------------------------------------------------------------------
+
+def cmd_notify(args) -> int:
+    """Generate a text summary of cleanup actions for Slack/Discord."""
+    default_branch = get_default_branch()
+    current_branch = get_current_branch()
+
+    merged = git_lines("branch", "--merged", default_branch)
+    merged_clean = []
+    for b in merged:
+        b_clean = b.lstrip('*').strip()
+        if b_clean != default_branch and b_clean != current_branch:
+            merged_clean.append(b_clean)
+
+    all_branches = git_lines("branch")
+    stale = []
+    for b in all_branches:
+        b_clean = b.lstrip('*').strip()
+        if b_clean == default_branch or b_clean == current_branch:
+            continue
+        if b_clean not in merged_clean:
+            age = get_branch_age(b_clean)
+            if age >= 30:
+                stale.append((b_clean, age))
+
+    lines = ["📋 *GitCleanup Summary*"]
+    repo_name = git_lines("rev-parse", "--show-toplevel")[0].split("/")[-1]
+    lines.append(f"*Repo:* `{repo_name}`")
+    lines.append(f"*Default branch:* `{default_branch}`")
+    lines.append(f"*Date:* {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
+    lines.append("")
+
+    if merged_clean:
+        lines.append(f"🔀 *{len(merged_clean)} merged branches ready to delete:*")
+        for b in merged_clean[:10]:
+            lines.append(f"  • `{b}`")
+        if len(merged_clean) > 10:
+            lines.append(f"  • ... and {len(merged_clean) - 10} more")
+    else:
+        lines.append("✅ No merged branches to clean up")
+
+    if stale:
+        lines.append(f"\n⏰ *{len(stale)} stale branches (>30d):*")
+        for b, age in stale[:10]:
+            lines.append(f"  • `{b}` ({age}d old)")
+        if len(stale) > 10:
+            lines.append(f"  • ... and {len(stale) - 10} more")
+
+    # Orphan estimate
+    orphaned = git("count-objects", "-v")
+    orphan_count = 0
+    if orphaned.returncode == 0:
+        for line in orphaned.stdout.split('\n'):
+            if 'prune-packable' in line:
+                try:
+                    orphan_count = int(line.split(':')[1].strip())
+                except (ValueError, IndexError):
+                    pass
+    if orphan_count:
+        lines.append(f"\n🗑️ *{orphan_count} orphaned objects* (prune-packable)")
+
+    text = "\n".join(lines)
+    if args.format == "json":
+        print(json.dumps({"summary": text, "merged_count": len(merged_clean),
+                          "stale_count": len(stale), "orphan_count": orphan_count}))
+    else:
+        print(text)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# v2: schedule command
+# ---------------------------------------------------------------------------
+
+def cmd_schedule(args) -> int:
+    """Show a suggested cleanup schedule based on repo activity."""
+    # Analyze branch ages and activity patterns
+    all_branches = git_lines("branch")
+    default_branch = get_default_branch()
+    current_branch = get_current_branch()
+
+    branch_data = []
+    for b in all_branches:
+        b_clean = b.lstrip('*').strip()
+        if b_clean == default_branch or b_clean == current_branch or b_clean.startswith("remotes/"):
+            continue
+        age = get_branch_age(b_clean)
+        activity = get_branch_activity(b_clean, 90)
+        branch_data.append({
+            "branch": b_clean,
+            "age_days": age,
+            "commits_90d": activity["commits_30d"],
+        })
+
+    if not branch_data:
+        if args.format == "json":
+            print(json.dumps({"schedule": "weekly", "reason": "no branches to analyze"}))
+        else:
+            print("No feature branches to analyze.")
+        return 0
+
+    # Calculate metrics
+    ages = [b["age_days"] for b in branch_data]
+    avg_age = sum(ages) / len(ages) if ages else 0
+    max_age = max(ages) if ages else 0
+    active_branches = [b for b in branch_data if b["commits_90d"] > 0]
+    stale_branches_30d = [b for b in branch_data if b["age_days"] > 30 and b["commits_90d"] == 0]
+    stale_branches_90d = [b for b in branch_data if b["age_days"] > 90 and b["commits_90d"] == 0]
+
+    # Determine schedule recommendation
+    if len(stale_branches_30d) > 5 or max_age > 180:
+        schedule = "weekly"
+        reason = "many stale branches or very old branches detected"
+    elif len(stale_branches_90d) > 2:
+        schedule = "bi-weekly"
+        reason = "moderate number of stale branches detected"
+    elif len(active_branches) >= len(branch_data) * 0.7:
+        schedule = "monthly"
+        reason = "most branches are active, low cleanup urgency"
+    else:
+        schedule = "monthly"
+        reason = "normal activity patterns"
+
+    result = {
+        "schedule": schedule,
+        "reason": reason,
+        "total_branches": len(branch_data),
+        "active_branches": len(active_branches),
+        "stale_30d": len(stale_branches_30d),
+        "stale_90d": len(stale_branches_90d),
+        "average_branch_age_days": round(avg_age, 1),
+        "oldest_branch_days": max_age,
+    }
+
+    if args.format == "json":
+        print(json.dumps(result, indent=2))
+    else:
+        print("📅 *Suggested Cleanup Schedule*")
+        print(f"  Recommended: {schedule}")
+        print(f"  Reason: {reason}")
+        print()
+        print(f"  Total feature branches: {len(branch_data)}")
+        print(f"  Active branches (commits in 90d): {len(active_branches)}")
+        print(f"  Stale > 30d (no activity): {len(stale_branches_30d)}")
+        print(f"  Stale > 90d (no activity): {len(stale_branches_90d)}")
+        print(f"  Average branch age: {avg_age:.1f} days")
+        print(f"  Oldest branch: {max_age} days")
+    return 0
+
+
 def main():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--format", choices=["text", "json"], default="text",
@@ -312,6 +555,8 @@ def main():
                          help="Age threshold in days for stale branches (default: 90)")
     sp_scan.add_argument("--dry-run", action="store_true", default=True,
                          help="Dry-run mode (default for scan)")
+    sp_scan.add_argument("--remote", action="store_true",
+                         help="Also check remote branches (v2)")
 
     sp_clean = sub.add_parser("clean", parents=[common],
                               help="Delete merged branches")
@@ -332,6 +577,14 @@ def main():
     sp_orphans.add_argument("--verbose", "-v", action="store_true",
                             help="Show detailed object list")
 
+    # v2: notify
+    sp_notify = sub.add_parser("notify", parents=[common],
+                               help="Generate cleanup summary for Slack/Discord (v2)")
+
+    # v2: schedule
+    sp_schedule = sub.add_parser("schedule", parents=[common],
+                                 help="Suggest cleanup schedule based on repo activity (v2)")
+
     args = p.parse_args()
 
     if args.cmd == "scan":
@@ -342,6 +595,10 @@ def main():
         return cmd_prune(args)
     elif args.cmd == "orphans":
         return cmd_orphans(args)
+    elif args.cmd == "notify":
+        return cmd_notify(args)
+    elif args.cmd == "schedule":
+        return cmd_schedule(args)
 
     return 0
 
